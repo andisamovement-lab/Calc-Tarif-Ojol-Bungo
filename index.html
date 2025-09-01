@@ -1,0 +1,316 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>Kalkulator Tarif Ojol - Kabupaten Bungo</title>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
+  <style>
+    :root{
+      --card-bg:#fff; --muted:#f3f4f6; --border:#e5e7eb; --ok:#16a34a; --danger:#dc2626; --text:#111827;
+    }
+    body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,"Helvetica Neue",Arial,"Noto Sans",sans-serif;background:var(--muted);color:var(--text);margin:0;padding:20px}
+    .fare-card{background:var(--card-bg);max-width:760px;margin:auto;padding:16px 16px 20px;border-radius:14px;box-shadow:0 6px 18px rgba(0,0,0,.08)}
+    h2{margin:0 0 8px}
+    p.helper{margin:0 0 14px;color:#374151}
+    .row{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+    .field{position:relative}
+    label{display:block;margin-top:10px;font-size:.92rem;color:#374151}
+    input[type="text"],input[type="number"]{
+      width:100%;padding:9px 10px;border:1px solid var(--border);border-radius:10px;outline:none;
+    }
+    input[type="text"]:focus,input[type="number"]:focus{border-color:#60a5fa;box-shadow:0 0 0 3px rgba(96,165,250,.25)}
+    .btn{margin-top:10px;padding:10px 12px;border:none;border-radius:10px;color:#fff;cursor:pointer}
+    #calcBtn{background:var(--ok)}
+    #resetBtn{background:var(--danger);margin-left:8px}
+    .result-box{margin-top:12px;padding:12px;background:#f9fafb;border:1px solid var(--border);border-radius:10px}
+    #map{height:380px;border-radius:12px;margin-top:12px}
+
+    /* Autocomplete dropdown (murni JS/CSS) */
+    .suggestions{
+      position:absolute; left:0; right:0; top:100%; margin-top:4px;
+      background:#fff;border:1px solid var(--border);border-radius:10px;box-shadow:0 10px 24px rgba(0,0,0,.08);
+      max-height:180px; overflow:auto; z-index:9999;
+    }
+    .suggestion-item{padding:8px 10px;cursor:pointer;font-size:.95rem}
+    .suggestion-item:hover{background:#f1f5f9}
+    .muted{color:#6b7280;font-size:.9rem}
+    .inline{display:flex;flex-wrap:wrap;gap:8px}
+    @media (max-width:720px){.row{grid-template-columns:1fr}}
+  </style>
+</head>
+<body>
+  <div class="fare-card">
+    <h2>Kalkulator Tarif Ojol - Kabupaten Bungo</h2>
+    <p class="helper">Pilih titik di peta atau ketik nama lokasi/koordinat. Perhitungan tarif berbasis jarak.</p>
+
+    <div class="row">
+      <div class="field">
+        <label for="fromInput">Lokasi Awal</label>
+        <input type="text" id="fromInput" placeholder="Contoh: Talang Pantai / -1.4975, 102.4381" autocomplete="off"/>
+        <div id="fromSuggestions" class="suggestions" style="display:none"></div>
+      </div>
+      <div class="field">
+        <label for="toInput">Lokasi Tujuan</label>
+        <input type="text" id="toInput" placeholder="Contoh: Sungai Binjai / -1.3000, 102.5000" autocomplete="off"/>
+        <div id="toSuggestions" class="suggestions" style="display:none"></div>
+      </div>
+    </div>
+
+    <div class="row">
+      <div class="field">
+        <label for="baseFare">Biaya Dasar (Rp)</label>
+        <input type="number" id="baseFare" value="5000" min="0"/>
+      </div>
+      <div class="field">
+        <label for="perKm">Tarif per Km (Rp)</label>
+        <input type="number" id="perKm" value="2000" min="0"/>
+      </div>
+    </div>
+
+    <div class="inline">
+      <button id="calcBtn" class="btn">Hitung Tarif & Simulasikan</button>
+      <button id="resetBtn" class="btn">Reset</button>
+    </div>
+
+    <div id="result" class="result-box" style="display:none"></div>
+    <div id="error" class="muted"></div>
+
+    <div id="map"></div>
+  </div>
+
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <script>
+    document.addEventListener("DOMContentLoaded", ()=>{
+      /* ====== PETA & BATAS BUNGO ====== */
+      const map = L.map('map').setView([-1.4975, 102.4381], 12);
+      L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { attribution:'© OpenStreetMap' }).addTo(map);
+
+      // Batas Kabupaten Bungo (kira-kira)
+      const bungoBounds = L.latLngBounds(L.latLng(-1.9, 101.9), L.latLng(-1.1, 102.8));
+      map.setMaxBounds(bungoBounds);
+      map.on('drag', () => map.panInsideBounds(bungoBounds, { animate:true }));
+
+      let fromMarker=null, toMarker=null, fromCoords=null, toCoords=null;
+      let fullLine=null, animMarker=null, animTimer=null;
+
+      /* ====== UTIL ====== */
+      const coordRegex=/^-?\d+(\.\d+)?\s*,\s*-?\d+(\.\d+)?$/;
+
+      function parseCoords(text){
+        if(!coordRegex.test(text.trim())) return null;
+        const [latS,lngS]=text.split(",");
+        const lat=parseFloat(latS); const lng=parseFloat(lngS);
+        if(Number.isNaN(lat)||Number.isNaN(lng)) return null;
+        return L.latLng(lat,lng);
+      }
+
+      function haversine(lat1, lon1, lat2, lon2){
+        const R=6371, toRad=x=>x*Math.PI/180;
+        const dLat=toRad(lat2-lat1), dLon=toRad(lon2-lon1);
+        const a=Math.sin(dLat/2)**2 + Math.cos(toRad(lat1))*Math.cos(toRad(lat2))*Math.sin(dLon/2)**2;
+        return R*2*Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
+      }
+
+      function computeFare(km){
+        const base=Number(document.getElementById('baseFare').value)||0;
+        const perKm=Number(document.getElementById('perKm').value)||0;
+        return Math.round(base + km*perKm);
+      }
+
+      function setMarker(isFrom, ll, label){
+        const marker=L.marker(ll).addTo(map).bindPopup(label).openPopup();
+        if(isFrom){ if(fromMarker) map.removeLayer(fromMarker); fromMarker=marker; fromCoords=ll; }
+        else{ if(toMarker) map.removeLayer(toMarker); toMarker=marker; toCoords=ll; }
+      }
+
+      function fitIfBoth(){
+        if(fromCoords && toCoords){
+          const bounds=L.latLngBounds([fromCoords,toCoords]);
+          map.fitBounds(bounds,{padding:[40,40]});
+        }
+      }
+
+      /* ====== AUTOCOMPLETE (MURNI JS/CSS) ====== */
+      const fromInput=document.getElementById('fromInput');
+      const toInput=document.getElementById('toInput');
+      const fromBox=document.getElementById('fromSuggestions');
+      const toBox=document.getElementById('toSuggestions');
+
+      function debounce(fn,delay=350){ let t; return (...args)=>{ clearTimeout(t); t=setTimeout(()=>fn(...args),delay); } }
+
+      async function fetchSuggestions(query, boxEl, inputEl, isFrom){
+        if(!query || query.trim().length<3){ boxEl.style.display='none'; boxEl.innerHTML=''; return; }
+
+        // Jika user ketik koordinat, jangan panggil API
+        if(coordRegex.test(query.trim())){ boxEl.style.display='none'; boxEl.innerHTML=''; return; }
+
+        // Nominatim API, dibatasi area Bungo via viewbox + bounded=1 + countrycodes=id
+        const viewbox = "101.9,-1.1,102.8,-1.9"; // left,top,right,bottom
+        const url = `https://nominatim.openstreetmap.org/search?format=jsonv2&limit=8&countrycodes=id&bounded=1&viewbox=${encodeURIComponent(viewbox)}&q=${encodeURIComponent(query + ', Bungo, Jambi')}`;
+
+        try{
+          const res = await fetch(url, { headers: { "Accept-Language":"id" }});
+          const data = await res.json();
+
+          boxEl.innerHTML='';
+          if(!Array.isArray(data) || data.length===0){ boxEl.style.display='none'; return; }
+
+          data.forEach(place=>{
+            const div=document.createElement('div');
+            div.className='suggestion-item';
+            div.textContent=place.display_name;
+            div.onclick=()=>{
+              inputEl.value=place.display_name;
+              const ll=L.latLng(parseFloat(place.lat), parseFloat(place.lon));
+              setMarker(isFrom, ll, isFrom?'Lokasi Awal':'Lokasi Tujuan');
+              boxEl.style.display='none'; boxEl.innerHTML='';
+              map.setView(ll, 14);
+              fitIfBoth();
+            };
+            boxEl.appendChild(div);
+          });
+          boxEl.style.display='block';
+        }catch(err){
+          // diamkan; user bisa tetap pakai koordinat/manual
+          boxEl.style.display='none';
+        }
+      }
+
+      const debFrom = debounce((e)=>fetchSuggestions(e.target.value, fromBox, fromInput, true));
+      const debTo   = debounce((e)=>fetchSuggestions(e.target.value, toBox, toInput, false));
+
+      fromInput.addEventListener('input', debFrom);
+      toInput.addEventListener('input', debTo);
+
+      // Tutup dropdown saat klik di luar
+      document.addEventListener('click', (e)=>{
+        if(!fromBox.contains(e.target) && e.target!==fromInput){ fromBox.style.display='none'; }
+        if(!toBox.contains(e.target) && e.target!==toInput){ toBox.style.display='none'; }
+      });
+
+      /* ====== INTERAKSI MAP (klik isi otomatis) ====== */
+      map.on('click', (e)=>{
+        if(!fromCoords){
+          setMarker(true, e.latlng, 'Lokasi Awal');
+          fromInput.value = `${e.latlng.lat.toFixed(5)}, ${e.latlng.lng.toFixed(5)}`;
+        }else if(!toCoords){
+          setMarker(false, e.latlng, 'Lokasi Tujuan');
+          toInput.value = `${e.latlng.lat.toFixed(5)}, ${e.latlng.lng.toFixed(5)}`;
+        }
+        fitIfBoth();
+      });
+
+      /* ====== POLYLINE & ANIMASI ====== */
+      function animateLine(fromLL, toLL){
+        // Bersihkan sebelumnya
+        if(fullLine) map.removeLayer(fullLine);
+        if(animMarker) map.removeLayer(animMarker);
+        if(animTimer) clearInterval(animTimer);
+
+        const fullRoute=[fromLL, toLL];
+        fullLine = L.polyline(fullRoute, {color:'blue', weight:4, opacity:0.9}).addTo(map);
+        animMarker = L.marker(fromLL, {icon: L.divIcon({className:'car-icon', html:'🚖', iconSize:[24,24]})}).addTo(map);
+
+        // Interpolasi 120 langkah (linear)
+        const steps=120;
+        const latStep=(toLL.lat - fromLL.lat)/steps;
+        const lngStep=(toLL.lng - fromLL.lng)/steps;
+        let i=0;
+
+        animTimer=setInterval(()=>{
+          i++;
+          const cur = L.latLng(fromLL.lat + latStep*i, fromLL.lng + lngStep*i);
+          animMarker.setLatLng(cur);
+          // kurangi garis: dari posisi sekarang ke tujuan
+          fullLine.setLatLngs([cur, toLL]);
+
+          if(i>=steps){
+            clearInterval(animTimer);
+            // hilangkan polyline saat tiba
+            map.removeLayer(fullLine);
+          }
+        }, 90); // ~10-11 detik total
+      }
+
+      /* ====== GEOCODING UTAMA (ENTER/HITUNG) ====== */
+      async function resolveInputToLatLng(text, isFrom){
+        if(!text || !text.trim()) return null;
+
+        // Jika koordinat
+        const parsed = parseCoords(text);
+        if(parsed) return parsed;
+
+        // Jika nama tempat → geocode
+        const viewbox = "101.9,-1.1,102.8,-1.9";
+        const url = `https://nominatim.openstreetmap.org/search?format=jsonv2&limit=1&countrycodes=id&bounded=1&viewbox=${encodeURIComponent(viewbox)}&q=${encodeURIComponent(text + ', Bungo, Jambi')}`;
+        try{
+          const res = await fetch(url, { headers: { "Accept-Language":"id" }});
+          const data = await res.json();
+          if(Array.isArray(data) && data.length>0){
+            return L.latLng(parseFloat(data[0].lat), parseFloat(data[0].lon));
+          }
+          alert((isFrom?'Lokasi awal':'Lokasi tujuan')+' tidak ditemukan. Coba perjelas nama atau gunakan koordinat lat,lng.');
+          return null;
+        }catch(err){
+          alert('Gagal menghubungi layanan pencarian lokasi. Coba lagi.');
+          return null;
+        }
+      }
+
+      /* ====== TOMBOL HITUNG ====== */
+      document.getElementById('calcBtn').addEventListener('click', async ()=>{
+        document.getElementById('error').textContent='';
+
+        // Pastikan kedua lokasi ada; jika belum, resolve dari input
+        if(!fromCoords){
+          const ll = await resolveInputToLatLng(fromInput.value, true);
+          if(ll){ setMarker(true, ll, 'Lokasi Awal'); }
+        }
+        if(!toCoords){
+          const ll = await resolveInputToLatLng(toInput.value, false);
+          if(ll){ setMarker(false, ll, 'Lokasi Tujuan'); }
+        }
+
+        if(!fromCoords || !toCoords){
+          alert('Silakan isi Lokasi Awal & Lokasi Tujuan dengan benar.');
+          return;
+        }
+
+        // Hitung jarak & tarif
+        const distKm = haversine(fromCoords.lat, fromCoords.lng, toCoords.lat, toCoords.lng);
+        const fare = computeFare(distKm);
+
+        document.getElementById('result').style.display='block';
+        document.getElementById('result').innerHTML = `
+          <strong>Jarak:</strong> ${distKm.toFixed(2)} km<br/>
+          <strong>Estimasi Tarif:</strong> Rp ${fare.toLocaleString('id-ID')}
+        `;
+
+        // Zoom agar keduanya terlihat, lalu animasi
+        fitIfBoth();
+        animateLine(fromCoords, toCoords);
+      });
+
+      /* ====== RESET ====== */
+      document.getElementById('resetBtn').addEventListener('click', ()=>{
+        if(fromMarker) map.removeLayer(fromMarker);
+        if(toMarker) map.removeLayer(toMarker);
+        if(fullLine) map.removeLayer(fullLine);
+        if(animMarker) map.removeLayer(animMarker);
+        if(animTimer) clearInterval(animTimer);
+        fromMarker=toMarker=fullLine=animMarker=animTimer=null;
+        fromCoords=toCoords=null;
+
+        fromInput.value=''; toInput.value='';
+        document.getElementById('result').style.display='none';
+        document.getElementById('error').textContent='';
+        fromBox.style.display='none'; fromBox.innerHTML='';
+        toBox.style.display='none'; toBox.innerHTML='';
+        map.setView([-1.4975, 102.4381], 12);
+      });
+
+    });
+  </script>
+</body>
+</html>
